@@ -1,0 +1,103 @@
+generator client { provider = "prisma-client-js" }
+datasource db { provider = "postgresql" url = env("DATABASE_URL") }
+
+model User {
+  id String @id
+  username String
+  trustScore Float @default(100)
+  warningCount Int @default(0)
+  flaggedCount Int @default(0)
+  createdAt DateTime @default(now())
+  messages MessageHistory[]
+  flags MessageFlag[]
+  warnings UserWarning[]
+  mutes MuteRecord[]
+  conversations Conversation[]
+  @@index([trustScore])
+}
+
+model MessageHistory {
+  id String @id
+  userId String
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  content String @db.Text
+  channelId String
+  messageId String @unique
+  guildId String
+  urls String[]
+  mentions String[]
+  createdAt DateTime @default(now())
+  flags MessageFlag[]
+  @@index([userId])
+}
+
+model MessageFlag {
+  id String @id
+  messageId String @unique
+  message MessageHistory @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  userId String
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  flagType String
+  confidence Float
+  reason String @db.Text
+  flaggedByAI Boolean @default(true)
+  createdAt DateTime @default(now())
+  @@index([flagType])
+}
+
+model UserWarning {
+  id String @id
+  userId String
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  reason String @db.Text
+  issuedBy String
+  createdAt DateTime @default(now())
+  @@index([userId])
+}
+
+model MuteRecord {
+  id String @id
+  userId String
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  duration Int
+  reason String @db.Text
+  appliedBy String
+  createdAt DateTime @default(now())
+  unmuteAt DateTime
+  @@index([userId])
+}
+
+model Conversation {
+  id String @id
+  userId String
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages ConversationMessage[]
+  startedAt DateTime @default(now())
+  @@index([userId])
+}
+
+model ConversationMessage {
+  id String @id
+  conversationId String
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role String
+  content String @db.Text
+  createdAt DateTime @default(now())
+}
+
+model ServerConfig {
+  id String @id @default(cuid())
+  defaultMuteDuration Int @default(300)
+  scamConfidenceThreshold Float @default(0.7)
+  enableAIChat Boolean @default(true)
+  updatedAt DateTime @updatedAt
+}
+
+model AuditLog {
+  id String @id
+  action String
+  targetUser String?
+  reason String @db.Text
+  createdAt DateTime @default(now())
+  @@index([action])
+}
