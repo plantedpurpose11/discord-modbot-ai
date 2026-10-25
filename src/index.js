@@ -1,199 +1,81 @@
-const { Client, GatewayIntentBits } = require('discord.js');
-const { PrismaClient } = require('@prisma/client');
-const redis = require('redis');
 require('dotenv').config();
-
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.DirectMessages,
-    GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers,
-  ],
-});
-
-const prisma = new PrismaClient();
-const redisClient = redis.createClient({ url: process.env.REDIS_URL || 'redis://localhost:6379' });
-
-// Import systems
-const { analyzeWithOllama, analyzeWithClaude } = require('./systems/ai/dualAI');
-const { checkLocalPatterns } = require('./systems/moderation/patterns');
-const { handleEscalation } = require('./systems/moderation/escalation');
-
-(async () => {
-  try {
-    if (!redisClient.isOpen) await redisClient.connect();
-    await prisma.$queryRaw`SELECT 1`;
-    console.log('✅ Database connected');
-    let config = await prisma.serverConfig.findFirst();
-    if (!config) config = await prisma.serverConfig.create({ data: { id: 'default' } });
-    client.prisma = prisma;
-    client.redis = redisClient;
-    client.config = config;
-    console.log('✅ Bot initialized');
-  } catch (error) {
-    console.error('Init error:', error);
-    process.exit(1);
+const { Client, GatewayIntentBits, Partials, ActivityType } = require('discord.js');
+const { PrismaClient } = require('@prisma/client');
+const { createClient } = require('redis');
+const { AI } = require('./systems/ai/dualAI');
+const { Moderation } = require('./systems/moderation/engine');
+const { handleInteraction } = require('./commands');
+const { attachmentIdentity } = require('./systems/inspection/scanner');
+const { getConfig } = require('./config');
+async function cleanup(db) {
+  const guilds = await db.guildSettings.findMany({ select: { id: true } });
+  // Cases can exist before a guild saves settings.
+  const caseGuilds = await db.moderationCase.findMany({ distinct: ['guildId'], select: { guildId: true } });
+  const exampleGuilds = await db.learningExample.findMany({ distinct: ['guildId'], select: { guildId: true } });
+  const feedbackGuilds = await db.staffFeedback.findMany({ distinct: ['guildId'], select: { guildId: true } });
+  for (const id of new Set([...guilds.map(g => g.id), ...caseGuilds.map(g => g.guildId), ...exampleGuilds.map(g => g.guildId), ...feedbackGuilds.map(g => g.guildId)])) {
+    const config = await getConfig(db, id);
+    const cutoff = new Date(Date.now() - config.retentionDays * 86400000);
+    await db.moderationCase.deleteMany({ where: { guildId: id, createdAt: { lt: cutoff } } });
+    await db.staffFeedback.deleteMany({ where: { guildId: id, createdAt: { lt: cutoff } } });
+    await db.learningExample.deleteMany({ where: { guildId: id, updatedAt: { lt: cutoff } } });
   }
-})();
-
-client.once('ready', () => {
-  console.log(`✅ Bot logged in as ${client.user.tag}`);
-  client.user.setActivity('your server', { type: 'WATCHING' });
-});
-
-client.on('messageCreate', async (message) => {
-  if (message.author.bot) return;
-  
-  try {
-    let user = await client.prisma.user.findUnique({ where: { id: message.author.id } });
-    if (!user) {
-      user = await client.prisma.user.create({ 
-        data: { id: message.author.id, username: message.author.username } 
-      });
-    }
-
-    const urls = message.content.match(/https?:\/\/[^\s]+/g) || [];
-    const mentions = Array.from(message.mentions.users.keys());
-
-    await client.prisma.messageHistory.create({
-      data: {
-        id: message.id,
-        userId: message.author.id,
-        content: message.content,
-        channelId: message.channelId,
-        messageId: message.id,
-        guildId: message.guildId,
-        containsURL: urls.length > 0,
-        urls,
-        mentions,
-      },
-    });
-
-    // STEP 1: Check local patterns first (NO API COST)
-    const localResult = checkLocalPatterns(message.content);
-    if (localResult.flagged && localResult.confidence > 0.85) {
-      console.log(`⚠️ Local pattern detected: ${localResult.type}`);
-      await flagMessage(client, user, message, localResult.type, localResult.confidence, 'Local pattern match', true);
-      if (localResult.confidence > 0.9) {
-        await handleEscalation(client, user, message, 'pattern_match');
-      }
-      return;
-    }
-
-    // STEP 2: Check cache for URLs (NO API COST)
-    let cachedAnalysis = null;
-    if (urls.length > 0) {
-      const cacheKey = `analysis:${urls[0]}`;
-      const cached = await client.redis.get(cacheKey);
-      if (cached) {
-        cachedAnalysis = JSON.parse(cached);
-        console.log(`✅ Cache hit for URL: ${urls[0]}`);
-      }
-    }
-
-    if (cachedAnalysis) {
-      if (cachedAnalysis.isScam && cachedAnalysis.confidence > 0.7) {
-        await flagMessage(client, user, message, cachedAnalysis.scamType, cachedAnalysis.confidence, 'Cached analysis', true);
-      }
-      return;
-    }
-
-    // STEP 3: Use Ollama for quick screening (FREE, LOCAL)
-    console.log(`🤖 Ollama screening: ${message.author.username}`);
-    const ollamaResult = await analyzeWithOllama(message.content, urls);
-
-    if (ollamaResult.isSuspicious && ollamaResult.confidence > 0.7) {
-      console.log(`⚠️ Ollama flagged: ${ollamaResult.type} (${ollamaResult.confidence})`);
-      
-      // Cache the result
-      if (urls.length > 0) {
-        await client.redis.setEx(`analysis:${urls[0]}`, 24*60*60, JSON.stringify(ollamaResult));
-      }
-
-      await flagMessage(client, user, message, ollamaResult.type, ollamaResult.confidence, ollamaResult.reason, true);
-      
-      // Only use Claude for uncertain cases or when Ollama says it's bad
-      if (ollamaResult.confidence > 0.85) {
-        return; // High confidence, no need for Claude
-      }
-    }
-
-    // STEP 4: Only use Claude for edge cases (MINIMAL API COST)
-    const shouldUseClaude = 
-      (ollamaResult.isSuspicious && ollamaResult.confidence <= 0.85) ||
-      (user.flaggedCount > 2) ||
-      (urls.length > 0 && !ollamaResult.isSuspicious);
-
-    if (shouldUseClaude) {
-      console.log(`🧠 Claude analyzing: ${message.author.username} (${ollamaResult.confidence} confidence)`);
-      const claudeResult = await analyzeWithClaude(message.content, urls, ollamaResult);
-
-      if (claudeResult) {
-        // Cache it
-        if (urls.length > 0) {
-          await client.redis.setEx(`analysis:${urls[0]}`, 24*60*60, JSON.stringify(claudeResult));
-        }
-
-        if (claudeResult.isScam && claudeResult.confidence > client.config.scamConfidenceThreshold) {
-          await flagMessage(client, user, message, claudeResult.scamType, claudeResult.confidence, claudeResult.reasoning, true);
-          
-          if (claudeResult.confidence > 0.85) {
-            await handleEscalation(client, user, message, 'high_confidence_scam');
-          }
-        }
-      }
-    }
-
-    if (message.mentions.has(client.user)) {
-      await message.reply('Hello! I\'m monitoring your server.');
-    }
-  } catch (error) {
-    console.error('Message error:', error);
-  }
-});
-
-async function flagMessage(client, user, message, flagType, confidence, reason, byAI = false) {
-  try {
-    await client.prisma.messageFlag.create({
-      data: {
-        messageId: message.id,
-        userId: user.id,
-        flagType,
-        confidence,
-        reason,
-        flaggedByAI: byAI,
-        severity: confidence > 0.8 ? 'critical' : confidence > 0.6 ? 'high' : 'medium',
-      },
-    });
-
-    await client.prisma.user.update({
-      where: { id: user.id },
-      data: { flaggedCount: { increment: 1 } },
-    });
-  } catch (error) {
-    console.error('Error flagging message:', error);
-  }
+  await db.dailyUsage.deleteMany({ where: { createdAt: { lt: new Date(Date.now() - 7 * 86400000) } } });
 }
-
-client.on('error', (error) => console.error('Client error:', error));
-process.on('unhandledRejection', (reason) => console.error('Unhandled:', reason));
-
-async function shutdown(signal) {
-  console.log(`${signal} - shutting down...`);
-  client.destroy();
-  await prisma.$disconnect();
-  await redisClient.quit();
-  process.exit(0);
+async function main() {
+  for (const name of ['DISCORD_TOKEN', 'DATABASE_URL']) if (!process.env[name]) throw new Error(`Missing ${name}`);
+  const db = new PrismaClient();
+  const redis = createClient({ url: process.env.REDIS_URL || 'redis://localhost:6379', disableOfflineQueue: true, socket: { connectTimeout: 5000 } });
+  redis.on('error', error => console.error('Redis error:', error.code || error.name));
+  const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent], partials: [Partials.Message, Partials.Channel], allowedMentions: { parse: [], repliedUser: false } });
+  const ai = new AI({ db, redis });
+  const moderation = new Moderation({ db, redis, ai, client });
+  let timer;
+  let stopping = false;
+  async function shutdown() {
+    if (stopping) return;
+    stopping = true;
+    clearInterval(timer);
+    client.destroy();
+    await db.$disconnect();
+    if (redis.isOpen) await redis.disconnect();
+  }
+  process.once('SIGINT', () => shutdown().catch(console.error));
+  process.once('SIGTERM', () => shutdown().catch(console.error));
+  client.once('ready', () => {
+    console.log(`Sentinel ready as ${client.user.tag}`);
+    client.user.setActivity('/help • keeping the chaos tasteful', { type: ActivityType.Watching });
+  });
+  // Do not queue spam checks behind slow model requests. Redis counters are atomic,
+  // AI concurrency is independently bounded, and case claims prevent duplicate actions.
+  let pending = 0;
+  function enqueue(message, edited) {
+    if (stopping || !message.guildId || !message.author || message.author.bot || message.webhookId) return;
+    if (pending >= 500) { console.warn('Moderation overloaded: event dropped'); return; }
+    pending++;
+    moderation.process(message, { edited }).catch(error => console.error('Message processing failed:', error.code || error.name)).finally(() => { pending--; });
+  }
+  client.on('messageCreate', message => enqueue(message, false));
+  client.on('messageUpdate', async (previous, current) => {
+    try { const message = current.partial ? await current.fetch() : current; if (previous.content !== message.content || JSON.stringify(attachmentIdentity(previous)) !== JSON.stringify(attachmentIdentity(message))) enqueue(message, true); } catch (error) { console.warn('Edited message unavailable:', error.code || error.name); }
+  });
+  client.on('interactionCreate', interaction => handleInteraction(interaction, { db, redis, moderation, ai }).catch(error => console.error('Interaction failed:', error.code || error.name)));
+  client.on('error', error => console.error('Discord error:', error.code || error.name));
+  try {
+    await db.$connect();
+    await db.guildSettings.count(); // Fail startup if schema preparation was missed.
+    await redis.connect();
+    await cleanup(db);
+    let cleaning = false;
+    timer = setInterval(async () => {
+      if (cleaning) return;
+      cleaning = true;
+      try { await cleanup(db); } catch (error) { console.error('Retention cleanup failed:', error.code || error.name); } finally { cleaning = false; }
+    }, 3600000);
+    timer.unref();
+    await client.login(process.env.DISCORD_TOKEN);
+    return { client, db, redis, shutdown };
+  } catch (error) { await shutdown(); throw error; }
 }
-
-process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-
-client.login(process.env.DISCORD_TOKEN).catch((error) => {
-  console.error('Login failed:', error);
-  process.exit(1);
-});
-
-module.exports = { client, prisma, redisClient };
+if (require.main === module) main().catch(error => { console.error('Startup failed:', error.code || error.message); process.exitCode = 1; });
+module.exports = { main, cleanup };

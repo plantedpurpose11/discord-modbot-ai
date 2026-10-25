@@ -1,28 +1,19 @@
-async function handleEscalation(client, user, message, reason) {
+async function handleEscalation(message, config, verdict) {
+  if (config.mode === 'review' || verdict.confidence < config.aiThreshold || verdict.category === 'uncertain') return { action: 'review' };
+  let action = 'pending';
   try {
-    const warningCount = user.warningCount || 0;
-    const config = client.config;
-    const kickThreshold = config.warningsBeforeKick || 3;
-    const banThreshold = config.warningsBeforeBan || 5;
-
-    if (warningCount >= banThreshold) {
-      await message.guild.bans.create(user.id, { reason });
-      console.log(`🔨 Banned ${user.username}`);
-    } else if (warningCount >= kickThreshold) {
-      const member = await message.guild.members.fetch(user.id);
-      await member.kick(reason);
-      console.log(`👢 Kicked ${user.username}`);
-    } else if (warningCount > 0) {
-      const member = await message.guild.members.fetch(user.id);
-      await member.timeout(5 * 60 * 1000, reason);
-      console.log(`🔇 Muted ${user.username}`);
-    } else {
-      await client.prisma.user.update({ where: { id: user.id }, data: { warningCount: { increment: 1 } } });
-      console.log(`⚠️ Warned ${user.username}`);
+    await message.delete();
+    action = 'deleted';
+    if (config.mode === 'timeout' && config.timeoutSeconds > 0) {
+      const member = await message.guild.members.fetch(message.author.id);
+      if (!member.moderatable) return { action, actionError: 'Member cannot be timed out (permissions or role hierarchy)' };
+      // Do not shorten an existing staff timeout.
+      if ((member.communicationDisabledUntilTimestamp || 0) < Date.now() + config.timeoutSeconds * 1000) {
+        await member.timeout(config.timeoutSeconds * 1000, `Automatic moderation: ${verdict.category}`);
+        action = 'deleted + timed out';
+      }
     }
-  } catch (error) {
-    console.error('Escalation error:', error);
-  }
+    return { action };
+  } catch (error) { return { action: action === 'pending' ? 'failed' : action, actionError: `Discord action failed (${error.code || error.name})` }; }
 }
-
 module.exports = { handleEscalation };

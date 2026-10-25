@@ -5,21 +5,31 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "nodemon src/index.js"
+    "dev": "node --watch src/index.js",
+    "test": "node --test test/*.test.js",
+    "db:generate": "prisma generate",
+    "db:setup": "prisma db push",
+    "commands:register": "node scripts/register-commands.js",
+    "check": "node scripts/check.js",
+    "test:integration": "node --test test/integration.js"
   },
   "dependencies": {
-    "discord.js": "^14.14.0",
-    "@prisma/client": "^5.8.0",
     "@anthropic-ai/sdk": "^0.20.0",
-    "redis": "^4.6.13",
+    "@prisma/client": "^5.8.0",
     "axios": "^1.6.5",
+    "discord.js": "^14.14.0",
     "dotenv": "^16.3.1",
-    "winston": "^3.11.0"
+    "htmlparser2": "^12.0.0",
+    "ipaddr.js": "^2.5.0",
+    "jsqr": "^1.4.0",
+    "redis": "^4.6.13",
+    "sharp": "^0.35.5"
   },
   "devDependencies": {
-    "prisma": "^5.8.0"
+    "prisma": "^5.8.0",
+    "qrcode": "^1.5.4"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.0.0"
   }
 }

@@ -1,0 +1,62 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const { randomUUID } = require('node:crypto');
+const { PrismaClient } = require('@prisma/client');
+const { createClient } = require('redis');
+const { setConfig, getConfig, defaults } = require('../src/config');
+const { AI } = require('../src/systems/ai/dualAI');
+const { Moderation } = require('../src/systems/moderation/engine');
+const { checkSpam, contentHash } = require('../src/systems/moderation/patterns');
+const { cleanup } = require('../src');
+test('PostgreSQL and Redis integration: configuration, feedback, budgets, uniqueness, retention', async () => {
+  if (!process.env.DATABASE_URL || !new URL(process.env.DATABASE_URL).pathname.endsWith('_test')) throw new Error('Use an isolated DATABASE_URL with a database name ending in _test');
+  const db = new PrismaClient();
+  const redis = createClient({ url: process.env.REDIS_URL || 'redis://localhost:6379' });
+  redis.on('error', () => {});
+  const guildId = `test-${randomUUID()}`;
+  try {
+    await db.$connect(); await redis.connect();
+    await Promise.all([setConfig(db, guildId, 'spamLimit', 9), setConfig(db, guildId, 'mode', 'delete')]);
+    const config = await getConfig(db, guildId);
+    assert.equal(config.spamLimit, 9); assert.equal(config.mode, 'delete');
+    assert.equal((await getConfig(db, 'other')).mode, 'review');
+    const ai = new AI({ db, redis, env: {} });
+    const reservations = await Promise.all(Array.from({ length: 15 }, () => ai.reserve(guildId, 3)));
+    assert.equal(reservations.filter(Boolean).length, 3);
+    assert.equal(await new AI({ db, redis, env: {} }).reserve(guildId, 3), false);
+    const input = { guildId, channelId: 'channel', messageId: `message-${guildId}`, userId: 'member', content: 'example message', contentHash: contentHash('example message'), category: 'scam', confidence: 0.93, source: 'ollama', reason: 'example' };
+    const row = await db.moderationCase.create({ data: input });
+    await assert.rejects(db.moderationCase.create({ data: input }), error => error.code === 'P2002');
+    await db.moderationCase.create({ data: { ...input, content: 'edited', contentHash: contentHash('edited') } });
+    const moderation = new Moderation({ db, redis, ai, client: {} });
+    await assert.rejects(moderation.feedback('other', row.id, 'safe', 'staff'));
+    await moderation.feedback(guildId, row.id, 'approve', 'staff');
+    await moderation.feedback(guildId, row.id, 'safe', 'staff2');
+    const learned = await db.learningExample.findUnique({ where: { guildId_contentHash: { guildId, contentHash: input.contentHash } } });
+    assert.equal(learned.category, 'safe'); assert.equal(learned.moderatorId, 'staff2');
+    assert.equal(await db.staffFeedback.count({ where: { guildId } }), 2);
+    assert.equal((await db.moderationCase.findUnique({ where: { id: row.id } })).verdict, 'safe');
+    const message = { guildId, author: { id: 'member' }, content: 'repeat', mentions: { users: new Map(), roles: new Map() } };
+    assert.equal(await checkSpam(redis, message, defaults), null);
+    assert.equal(await checkSpam(redis, message, defaults), null);
+    assert.equal((await checkSpam(redis, message, defaults)).category, 'spam');
+    assert.ok(await redis.ttl(`spam:${guildId}:member`) > 0);
+    assert.equal(await checkSpam(redis, { ...message, guildId: `${guildId}-other` }, defaults), null);
+    const expired = new Date(Date.now() - 40 * 86400000);
+    await db.moderationCase.updateMany({ where: { guildId }, data: { createdAt: expired } });
+    await db.learningExample.updateMany({ where: { guildId }, data: { updatedAt: expired } });
+    await db.staffFeedback.updateMany({ where: { guildId }, data: { createdAt: expired } });
+    await cleanup(db);
+    assert.equal(await db.moderationCase.count({ where: { guildId } }), 0);
+    assert.equal(await db.learningExample.count({ where: { guildId } }), 0);
+    assert.equal(await db.staffFeedback.count({ where: { guildId } }), 0);
+  } finally {
+    await db.staffFeedback.deleteMany({ where: { guildId } });
+    await db.learningExample.deleteMany({ where: { guildId } });
+    await db.moderationCase.deleteMany({ where: { guildId } });
+    await db.guildSettings.deleteMany({ where: { id: guildId } });
+    await db.dailyUsage.deleteMany({ where: { id: { startsWith: guildId } } });
+    if (redis.isOpen) { for await (const key of redis.scanIterator({ MATCH: `spam:${guildId}*` })) await redis.del(key); await redis.quit(); }
+    await db.$disconnect();
+  }
+});
